@@ -4,6 +4,8 @@ import java.time.LocalDate;
 import java.time.LocalDateTime;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.HashSet;
+import java.util.Set;
 
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
@@ -29,6 +31,8 @@ import kr.co.mapspring.ai.entity.CoachingSession;
 import kr.co.mapspring.ai.enums.CoachingMessageRole;
 import kr.co.mapspring.ai.enums.CoachingSessionStatus;
 import kr.co.mapspring.ai.repository.CoachingMessageRepository;
+import kr.co.mapspring.ai.repository.CoachingPronunciationResultRepository;
+import kr.co.mapspring.ai.repository.CoachingScriptTurnRepository;
 import kr.co.mapspring.ai.repository.CoachingSessionRepository;
 import kr.co.mapspring.ai.repository.ContentRepository;
 import kr.co.mapspring.ai.service.CoachingConversationService;
@@ -68,6 +72,8 @@ public class CoachingConversationServiceImpl implements CoachingConversationServ
 
     private final CoachingSessionRepository coachingSessionRepository;
     private final CoachingMessageRepository coachingMessageRepository;
+    private final CoachingPronunciationResultRepository pronunciationResultRepository;
+    private final CoachingScriptTurnRepository coachingScriptTurnRepository;
     private final ContentRepository contentRepository;
     private final SubscriptionValidator subscriptionValidator;
 
@@ -123,24 +129,39 @@ public class CoachingConversationServiceImpl implements CoachingConversationServ
         if (coachingScriptTurnService.existsScriptTurns(coachingSessionId)) {
             CoachingScriptTurnDto.ResponseGetCoachingScriptTurns existingTurns =
                     coachingScriptTurnService.getScriptTurns(coachingSessionId);
+            ScriptTurnValidation validation = validateScriptTurns(existingTurns.getTurns());
 
-            log.info(
-                    "Returning existing coaching script turns. sessionId={}, coachingSessionId={}, requestedOptionType={}, selectedOption={}, turnCount={}",
+            if (validation.valid()) {
+                log.info(
+                        "Returning existing coaching script turns. sessionId={}, coachingSessionId={}, requestedOptionType={}, selectedOption={}, turnCount={}",
+                        sessionId,
+                        coachingSessionId,
+                        request.getOptionType(),
+                        effectiveOptionType,
+                        validation.turnCount()
+                );
+
+                return CoachingConversationDto.ResponsePrepareScript.builder()
+                        .coachingSessionId(coachingSessionId)
+                        .sessionId(sessionResponse.getSessionId())
+                        .coachingSessionStatus(sessionResponse.getCoachingSessionStatus())
+                        .selectedOption(effectiveOptionType)
+                        .currentTurnOrder(sessionResponse.getCurrentTurnOrder())
+                        .turns(existingTurns.getTurns())
+                        .build();
+            }
+
+            log.warn(
+                    "Invalid existing coaching script turns detected. sessionId={}, coachingSessionId={}, selectedOption={}, turnCount={}, duplicatedTurnOrders={}, invalidReason={}, recoveryAction=RESET_AND_REGENERATE",
                     sessionId,
                     coachingSessionId,
-                    request.getOptionType(),
                     effectiveOptionType,
-                    existingTurns.getTurns() == null ? 0 : existingTurns.getTurns().size()
+                    validation.turnCount(),
+                    validation.duplicatedTurnOrders(),
+                    validation.reason()
             );
 
-            return CoachingConversationDto.ResponsePrepareScript.builder()
-                    .coachingSessionId(coachingSessionId)
-                    .sessionId(sessionResponse.getSessionId())
-                    .coachingSessionStatus(sessionResponse.getCoachingSessionStatus())
-                    .selectedOption(effectiveOptionType)
-                    .currentTurnOrder(sessionResponse.getCurrentTurnOrder())
-                    .turns(existingTurns.getTurns())
-                    .build();
+            resetCoachingSessionScriptData(coachingSessionId);
         }
 
         log.info(
@@ -221,6 +242,23 @@ public class CoachingConversationServiceImpl implements CoachingConversationServ
         Long userId = getUserId(session);
 
         validateAiCoachingAccess(userId);
+
+        CoachingScriptTurnDto.ResponseGetCoachingScriptTurns existingTurns =
+                coachingScriptTurnService.getScriptTurns(coachingSessionId);
+        ScriptTurnValidation validation = validateScriptTurns(existingTurns.getTurns());
+
+        if (!validation.valid()) {
+            log.error(
+                    "Cannot start coaching conversation because script turns are invalid. coachingSessionId={}, selectedOption={}, turnCount={}, duplicatedTurnOrders={}, invalidReason={}, recoveryAction=RESET_ON_NEXT_PREPARE",
+                    coachingSessionId,
+                    session.getSelectedOption(),
+                    validation.turnCount(),
+                    validation.duplicatedTurnOrders(),
+                    validation.reason()
+            );
+            resetCoachingSessionScriptData(coachingSessionId);
+            throw new InvalidCoachingMessageException();
+        }
 
         CoachingScriptTurnDto.ResponseCoachingScriptTurn firstTurn =
                 coachingScriptTurnService.getScriptTurn(coachingSessionId, 1);
@@ -565,6 +603,73 @@ public class CoachingConversationServiceImpl implements CoachingConversationServ
         }
     }
 
+    private void resetCoachingSessionScriptData(Long coachingSessionId) {
+        pronunciationResultRepository
+                .deleteByCoachingScriptTurn_CoachingSession_CoachingSessionId(coachingSessionId);
+        coachingMessageRepository.deleteByCoachingSession_CoachingSessionId(coachingSessionId);
+        coachingScriptTurnRepository.deleteByCoachingSession_CoachingSessionId(coachingSessionId);
+
+        log.warn(
+                "Coaching session script data reset. coachingSessionId={}, recoveryAction=DELETE_PRONUNCIATION_RESULTS_MESSAGES_SCRIPT_TURNS",
+                coachingSessionId
+        );
+    }
+
+    private ScriptTurnValidation validateScriptTurns(
+            List<CoachingScriptTurnDto.ResponseCoachingScriptTurn> turns
+    ) {
+        if (turns == null || turns.isEmpty()) {
+            return new ScriptTurnValidation(false, 0, "none", "EMPTY_TURNS");
+        }
+
+        Set<Integer> seenTurnOrders = new HashSet<>();
+        List<Integer> duplicatedTurnOrders = new ArrayList<>();
+        boolean hasBlankText = false;
+
+        for (CoachingScriptTurnDto.ResponseCoachingScriptTurn turn : turns) {
+            if (turn == null || turn.getTurnOrder() == null) {
+                return new ScriptTurnValidation(
+                        false,
+                        turns.size(),
+                        duplicatedTurnOrders.toString(),
+                        "NULL_TURN_OR_ORDER"
+                );
+            }
+
+            if (!seenTurnOrders.add(turn.getTurnOrder())) {
+                duplicatedTurnOrders.add(turn.getTurnOrder());
+            }
+
+            if (turn.getAssistantText() == null || turn.getAssistantText().isBlank()
+                    || turn.getExpectedText() == null || turn.getExpectedText().isBlank()) {
+                hasBlankText = true;
+            }
+        }
+
+        boolean isConsecutive = true;
+
+        for (int order = 1; order <= turns.size(); order++) {
+            if (!seenTurnOrders.contains(order)) {
+                isConsecutive = false;
+                break;
+            }
+        }
+
+        boolean valid = duplicatedTurnOrders.isEmpty() && !hasBlankText && isConsecutive;
+        String reason = valid
+                ? "OK"
+                : "duplicate=" + !duplicatedTurnOrders.isEmpty()
+                + ",blankText=" + hasBlankText
+                + ",consecutive=" + isConsecutive;
+
+        return new ScriptTurnValidation(
+                valid,
+                turns.size(),
+                duplicatedTurnOrders.toString(),
+                reason
+        );
+    }
+
     private void validateAiCoachingAccess(Long userId) {
         if (!subscriptionValidator.isPremium(userId)) {
             throw new AiCoachingAccessDeniedException();
@@ -724,5 +829,13 @@ public class CoachingConversationServiceImpl implements CoachingConversationServ
         }
 
         return rootCause;
+    }
+
+    private record ScriptTurnValidation(
+            boolean valid,
+            int turnCount,
+            String duplicatedTurnOrders,
+            String reason
+    ) {
     }
 }

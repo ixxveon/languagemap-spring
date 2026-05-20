@@ -18,6 +18,8 @@ public interface CoachingMessageRepository extends JpaRepository<CoachingMessage
             Long coachingScriptTurnId,
             CoachingMessageRole role
     );
+
+    void deleteByCoachingSession_CoachingSessionId(Long coachingSessionId);
     
     long countByCoachingSession_LearningSession_User_UserIdAndRoleAndCreatedAtBetween(
             Long userId,
