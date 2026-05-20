@@ -416,6 +416,15 @@ public class CoachingConversationServiceImpl implements CoachingConversationServ
         CoachingPronunciationResultDto.ResponseGetPronunciationResults pronunciationResponse =
                 pronunciationResultService.getPronunciationResults(coachingSessionId);
 
+        log.info(
+                "Finishing coaching conversation. coachingSessionId={}, messageCount={}, pronunciationResultCount={}",
+                coachingSessionId,
+                messagesResponse.getMessages() == null ? 0 : messagesResponse.getMessages().size(),
+                pronunciationResponse.getPronunciationResults() == null ? 0 : pronunciationResponse.getPronunciationResults().size()
+        );
+
+        long finalFeedbackStartedAt = System.currentTimeMillis();
+
         FastApiOpenAiDto.ResponseFinalFeedback finalFeedback =
                 fastApiOpenAiClient.createFinalFeedback(
                         FastApiOpenAiDto.RequestFinalFeedback.builder()
@@ -423,6 +432,13 @@ public class CoachingConversationServiceImpl implements CoachingConversationServ
                                 .pronunciationResults(toFastApiPronunciationResults(pronunciationResponse))
                                 .build()
                 );
+
+        log.info(
+                "FastAPI final feedback completed. coachingSessionId={}, elapsedMs={}, totalScore={}",
+                coachingSessionId,
+                System.currentTimeMillis() - finalFeedbackStartedAt,
+                finalFeedback.getTotalScore()
+        );
 
         CoachingFeedbackDto.ResponseCoachingFeedback savedFeedback =
                 coachingFeedbackService.saveCoachingFeedback(
@@ -442,32 +458,7 @@ public class CoachingConversationServiceImpl implements CoachingConversationServ
 
         session.complete();
 
-        if (!contentRepository.existsByCoachingSession_CoachingSessionId(coachingSessionId)) {
-            FastApiOpenAiDto.ResponseYoutubeKeywords keywords =
-                    fastApiOpenAiClient.createYoutubeKeywords(
-                            FastApiOpenAiDto.RequestYoutubeKeywords.builder()
-                                    .finalFeedback(finalFeedback.getSummaryFeedback())
-                                    .build()
-                    );
-
-            if (keywords.getKeywords() != null && !keywords.getKeywords().isEmpty()) {
-                String keyword = keywords.getKeywords().get(0);
-
-                FastApiYoutubeDto.ResponseYoutubeSearch youtubeResponse =
-                        fastApiYoutubeClient.searchYoutube(
-                                FastApiYoutubeDto.RequestYoutubeSearch.builder()
-                                        .keyword(keyword)
-                                        .maxResults(AiUsageLimitPolicy.YOUTUBE_MAX_RESULTS)
-                                        .build()
-                        );
-
-                contentService.saveAll(
-                        coachingSessionId,
-                        keyword,
-                        youtubeResponse.getYoutubePicks()
-                );
-            }
-        }
+        createRecommendationContentsIfNeeded(coachingSessionId, finalFeedback);
 
         ContentDto.ResponseGetContents contents =
                 contentService.getContents(coachingSessionId);
@@ -477,6 +468,48 @@ public class CoachingConversationServiceImpl implements CoachingConversationServ
                 .pronunciationResults(pronunciationResponse)
                 .contents(contents)
                 .build();
+    }
+
+    private void createRecommendationContentsIfNeeded(
+            Long coachingSessionId,
+            FastApiOpenAiDto.ResponseFinalFeedback finalFeedback
+    ) {
+        if (!contentRepository.existsByCoachingSession_CoachingSessionId(coachingSessionId)) {
+            try {
+                FastApiOpenAiDto.ResponseYoutubeKeywords keywords =
+                        fastApiOpenAiClient.createYoutubeKeywords(
+                                FastApiOpenAiDto.RequestYoutubeKeywords.builder()
+                                        .finalFeedback(finalFeedback.getSummaryFeedback())
+                                        .build()
+                        );
+
+                if (keywords.getKeywords() != null && !keywords.getKeywords().isEmpty()) {
+                    String keyword = keywords.getKeywords().get(0);
+
+                    FastApiYoutubeDto.ResponseYoutubeSearch youtubeResponse =
+                            fastApiYoutubeClient.searchYoutube(
+                                    FastApiYoutubeDto.RequestYoutubeSearch.builder()
+                                            .keyword(keyword)
+                                            .maxResults(AiUsageLimitPolicy.YOUTUBE_MAX_RESULTS)
+                                            .build()
+                            );
+
+                    contentService.saveAll(
+                            coachingSessionId,
+                            keyword,
+                            youtubeResponse.getYoutubePicks()
+                    );
+                }
+            } catch (RuntimeException e) {
+                Throwable rootCause = getRootCause(e);
+                log.error(
+                        "Coaching recommendation content generation failed. coachingSessionId={}, causeClass={}, causeMessage={}",
+                        coachingSessionId,
+                        rootCause.getClass().getName(),
+                        rootCause.getMessage()
+                );
+            }
+        }
     }
 
     private void validateAiCoachingAccess(Long userId) {
