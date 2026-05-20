@@ -279,11 +279,12 @@ public class CoachingConversationServiceImpl implements CoachingConversationServ
                 );
 
         log.info(
-                "Processing coaching speech. coachingSessionId={}, userId={}, currentTurnOrder={}, audioFilename={}, audioSize={}",
+                "Processing coaching speech. coachingSessionId={}, userId={}, currentTurnOrder={}, audioFilename={}, audioContentType={}, audioSize={}",
                 coachingSessionId,
                 userId,
                 currentTurnOrder,
                 audioFile.getOriginalFilename(),
+                audioFile.getContentType(),
                 audioFile.getSize()
         );
 

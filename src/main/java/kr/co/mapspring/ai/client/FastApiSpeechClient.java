@@ -174,8 +174,9 @@ public class FastApiSpeechClient {
         MultipartBodyBuilder builder = new MultipartBodyBuilder();
 
         log.info(
-                "Preparing FastAPI pronunciation multipart. filename={}, size={}, referenceTextLength={}",
+                "Preparing FastAPI pronunciation multipart. filename={}, contentType={}, size={}, referenceTextLength={}",
                 audioFile.getOriginalFilename(),
+                audioFile.getContentType(),
                 audioFile.getSize(),
                 referenceText == null ? 0 : referenceText.length()
         );
@@ -183,7 +184,7 @@ public class FastApiSpeechClient {
         builder.part("reference_text", referenceText);
         builder.part("audio_file", toByteArrayResource(audioFile))
                 .filename(audioFile.getOriginalFilename())
-                .contentType(MediaType.APPLICATION_OCTET_STREAM);
+                .contentType(resolveContentType(audioFile));
 
         return builder.build();
     }
@@ -198,6 +199,20 @@ public class FastApiSpeechClient {
             };
         } catch (IOException e) {
             throw new FastApiAiClientException(e);
+        }
+    }
+
+    private MediaType resolveContentType(MultipartFile file) {
+        String contentType = file.getContentType();
+
+        if (contentType == null || contentType.isBlank()) {
+            return MediaType.APPLICATION_OCTET_STREAM;
+        }
+
+        try {
+            return MediaType.parseMediaType(contentType);
+        } catch (IllegalArgumentException e) {
+            return MediaType.APPLICATION_OCTET_STREAM;
         }
     }
 
