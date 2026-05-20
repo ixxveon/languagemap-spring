@@ -278,11 +278,31 @@ public class CoachingConversationServiceImpl implements CoachingConversationServ
                         currentTurnOrder
                 );
 
+        log.info(
+                "Processing coaching speech. coachingSessionId={}, userId={}, currentTurnOrder={}, audioFilename={}, audioSize={}",
+                coachingSessionId,
+                userId,
+                currentTurnOrder,
+                audioFile.getOriginalFilename(),
+                audioFile.getSize()
+        );
+
+        long pronunciationStartedAt = System.currentTimeMillis();
+
         FastApiSpeechDto.ResponsePronunciationAssessment pronunciation =
                 fastApiSpeechClient.assessPronunciation(
                         currentTurn.getExpectedText(),
                         audioFile
                 );
+
+        log.info(
+                "Pronunciation assessment completed. coachingSessionId={}, currentTurnOrder={}, elapsedMs={}, recognizedTextLength={}, hasFeedback={}",
+                coachingSessionId,
+                currentTurnOrder,
+                System.currentTimeMillis() - pronunciationStartedAt,
+                pronunciation.getRecognizedText() == null ? 0 : pronunciation.getRecognizedText().length(),
+                pronunciation.getFeedback() != null
+        );
 
         CoachingMessageDto.ResponseCoachingMessage savedUserMessage =
                 coachingMessageService.saveUserMessage(
@@ -329,12 +349,28 @@ public class CoachingConversationServiceImpl implements CoachingConversationServ
                         nextTurnOrder
                 );
 
+        log.info(
+                "Creating next assistant TTS. coachingSessionId={}, nextTurnOrder={}",
+                coachingSessionId,
+                nextTurnOrder
+        );
+
+        long nextTtsStartedAt = System.currentTimeMillis();
+
         FastApiSpeechDto.ResponseTts nextTts =
                 fastApiSpeechClient.createTts(
                         FastApiSpeechDto.RequestTts.builder()
                                 .text(nextTurn.getAssistantText())
                                 .build()
                 );
+
+        log.info(
+                "Next assistant TTS completed. coachingSessionId={}, nextTurnOrder={}, elapsedMs={}, audioUrlPresent={}",
+                coachingSessionId,
+                nextTurnOrder,
+                System.currentTimeMillis() - nextTtsStartedAt,
+                nextTts.getAudioUrl() != null
+        );
 
         coachingMessageService.saveAssistantMessage(
                 coachingSessionId,
