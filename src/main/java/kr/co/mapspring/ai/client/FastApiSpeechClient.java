@@ -15,11 +15,14 @@ import org.springframework.web.multipart.MultipartFile;
 import kr.co.mapspring.ai.dto.FastApiSpeechDto;
 import kr.co.mapspring.global.exception.ai.FastApiAiClientException;
 import lombok.RequiredArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
+
 import java.io.IOException;
 
 
 @Component
 @RequiredArgsConstructor
+@Slf4j
 public class FastApiSpeechClient {
 
     private final RestTemplate restTemplate;
@@ -67,9 +70,14 @@ public class FastApiSpeechClient {
     }
 
     private <T> T postJson(String path, Object request, Class<T> responseType) {
+        String url = createUrl(path);
+        long startedAt = System.currentTimeMillis();
+
         try {
+            log.info("Calling FastAPI speech endpoint. path={}, url={}", path, url);
+
             T response = restTemplate.postForObject(
-                    createUrl(path),
+                    url,
                     request,
                     responseType
             );
@@ -78,8 +86,23 @@ public class FastApiSpeechClient {
                 throw new FastApiAiClientException();
             }
 
+            log.info(
+                    "FastAPI speech endpoint completed. path={}, elapsedMs={}",
+                    path,
+                    System.currentTimeMillis() - startedAt
+            );
+
             return response;
         } catch (RestClientException e) {
+            Throwable rootCause = getRootCause(e);
+            log.error(
+                    "FastAPI speech request failed. path={}, url={}, elapsedMs={}, causeClass={}, causeMessage={}",
+                    path,
+                    url,
+                    System.currentTimeMillis() - startedAt,
+                    rootCause.getClass().getName(),
+                    rootCause.getMessage()
+            );
             throw new FastApiAiClientException(e);
         }
     }
@@ -89,6 +112,9 @@ public class FastApiSpeechClient {
             MultiValueMap<String, HttpEntity<?>> multipartBody,
             Class<T> responseType
     ) {
+        String url = createUrl(path);
+        long startedAt = System.currentTimeMillis();
+
         try {
             HttpHeaders headers = new HttpHeaders();
             headers.setContentType(MediaType.MULTIPART_FORM_DATA);
@@ -96,8 +122,10 @@ public class FastApiSpeechClient {
             HttpEntity<MultiValueMap<String, HttpEntity<?>>> requestEntity =
                     new HttpEntity<>(multipartBody, headers);
 
+            log.info("Calling FastAPI speech endpoint. path={}, url={}", path, url);
+
             T response = restTemplate.postForObject(
-                    createUrl(path),
+                    url,
                     requestEntity,
                     responseType
             );
@@ -106,8 +134,23 @@ public class FastApiSpeechClient {
                 throw new FastApiAiClientException();
             }
 
+            log.info(
+                    "FastAPI speech endpoint completed. path={}, elapsedMs={}",
+                    path,
+                    System.currentTimeMillis() - startedAt
+            );
+
             return response;
         } catch (RestClientException e) {
+            Throwable rootCause = getRootCause(e);
+            log.error(
+                    "FastAPI speech request failed. path={}, url={}, elapsedMs={}, causeClass={}, causeMessage={}",
+                    path,
+                    url,
+                    System.currentTimeMillis() - startedAt,
+                    rootCause.getClass().getName(),
+                    rootCause.getMessage()
+            );
             throw new FastApiAiClientException(e);
         }
     }
@@ -130,10 +173,18 @@ public class FastApiSpeechClient {
     ) {
         MultipartBodyBuilder builder = new MultipartBodyBuilder();
 
+        log.info(
+                "Preparing FastAPI pronunciation multipart. filename={}, contentType={}, size={}, referenceTextLength={}",
+                audioFile.getOriginalFilename(),
+                audioFile.getContentType(),
+                audioFile.getSize(),
+                referenceText == null ? 0 : referenceText.length()
+        );
+
         builder.part("reference_text", referenceText);
         builder.part("audio_file", toByteArrayResource(audioFile))
                 .filename(audioFile.getOriginalFilename())
-                .contentType(MediaType.APPLICATION_OCTET_STREAM);
+                .contentType(resolveContentType(audioFile));
 
         return builder.build();
     }
@@ -151,11 +202,35 @@ public class FastApiSpeechClient {
         }
     }
 
+    private MediaType resolveContentType(MultipartFile file) {
+        String contentType = file.getContentType();
+
+        if (contentType == null || contentType.isBlank()) {
+            return MediaType.APPLICATION_OCTET_STREAM;
+        }
+
+        try {
+            return MediaType.parseMediaType(contentType);
+        } catch (IllegalArgumentException e) {
+            return MediaType.APPLICATION_OCTET_STREAM;
+        }
+    }
+
     private String createUrl(String path) {
         if (fastApiBaseUrl.endsWith("/")) {
             return fastApiBaseUrl.substring(0, fastApiBaseUrl.length() - 1) + path;
         }
 
         return fastApiBaseUrl + path;
+    }
+
+    private Throwable getRootCause(Throwable throwable) {
+        Throwable rootCause = throwable;
+
+        while (rootCause.getCause() != null) {
+            rootCause = rootCause.getCause();
+        }
+
+        return rootCause;
     }
 }

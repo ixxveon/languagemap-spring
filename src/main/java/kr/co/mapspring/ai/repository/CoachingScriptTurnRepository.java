@@ -14,6 +14,11 @@ public interface CoachingScriptTurnRepository extends JpaRepository<CoachingScri
             Integer turnOrder
     );
 
+    List<CoachingScriptTurn> findAllByCoachingSession_CoachingSessionIdAndTurnOrderOrderByCreatedAtAsc(
+            Long coachingSessionId,
+            Integer turnOrder
+    );
+
     List<CoachingScriptTurn> findByCoachingSession_CoachingSessionIdOrderByTurnOrderAsc(
             Long coachingSessionId
     );
@@ -24,4 +29,6 @@ public interface CoachingScriptTurnRepository extends JpaRepository<CoachingScri
             Long coachingSessionId,
             Integer turnOrder
     );
+
+    void deleteByCoachingSession_CoachingSessionId(Long coachingSessionId);
 }

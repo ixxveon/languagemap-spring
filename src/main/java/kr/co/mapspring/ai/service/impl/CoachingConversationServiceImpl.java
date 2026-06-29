@@ -4,6 +4,8 @@ import java.time.LocalDate;
 import java.time.LocalDateTime;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.HashSet;
+import java.util.Set;
 
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
@@ -29,6 +31,8 @@ import kr.co.mapspring.ai.entity.CoachingSession;
 import kr.co.mapspring.ai.enums.CoachingMessageRole;
 import kr.co.mapspring.ai.enums.CoachingSessionStatus;
 import kr.co.mapspring.ai.repository.CoachingMessageRepository;
+import kr.co.mapspring.ai.repository.CoachingPronunciationResultRepository;
+import kr.co.mapspring.ai.repository.CoachingScriptTurnRepository;
 import kr.co.mapspring.ai.repository.CoachingSessionRepository;
 import kr.co.mapspring.ai.repository.ContentRepository;
 import kr.co.mapspring.ai.service.CoachingConversationService;
@@ -45,10 +49,13 @@ import kr.co.mapspring.global.exception.ai.AiSessionTurnLimitExceededException;
 import kr.co.mapspring.global.exception.ai.CoachingSessionNotFoundException;
 import kr.co.mapspring.global.exception.ai.InvalidCoachingMessageException;
 import kr.co.mapspring.global.policy.AiUsageLimitPolicy;
+import kr.co.mapspring.payment.service.SubscriptionValidator;
 import lombok.RequiredArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
 
 @Service
 @RequiredArgsConstructor
+@Slf4j
 @Transactional(readOnly = true)
 public class CoachingConversationServiceImpl implements CoachingConversationService {
 
@@ -65,7 +72,10 @@ public class CoachingConversationServiceImpl implements CoachingConversationServ
 
     private final CoachingSessionRepository coachingSessionRepository;
     private final CoachingMessageRepository coachingMessageRepository;
+    private final CoachingPronunciationResultRepository pronunciationResultRepository;
+    private final CoachingScriptTurnRepository coachingScriptTurnRepository;
     private final ContentRepository contentRepository;
+    private final SubscriptionValidator subscriptionValidator;
 
     private final ObjectMapper objectMapper;
 
@@ -93,6 +103,9 @@ public class CoachingConversationServiceImpl implements CoachingConversationServ
 
         Long coachingSessionId = sessionResponse.getCoachingSessionId();
         Long userId = sessionResponse.getUserId();
+        String effectiveOptionType = sessionResponse.getSelectedOption() != null
+                ? sessionResponse.getSelectedOption()
+                : request.getOptionType();
 
         validateAiCoachingAccess(userId);
 
@@ -116,29 +129,87 @@ public class CoachingConversationServiceImpl implements CoachingConversationServ
         if (coachingScriptTurnService.existsScriptTurns(coachingSessionId)) {
             CoachingScriptTurnDto.ResponseGetCoachingScriptTurns existingTurns =
                     coachingScriptTurnService.getScriptTurns(coachingSessionId);
+            ScriptTurnValidation validation = validateScriptTurns(existingTurns.getTurns());
 
-            return CoachingConversationDto.ResponsePrepareScript.builder()
-                    .coachingSessionId(coachingSessionId)
-                    .sessionId(sessionResponse.getSessionId())
-                    .coachingSessionStatus(sessionResponse.getCoachingSessionStatus())
-                    .selectedOption(sessionResponse.getSelectedOption())
-                    .currentTurnOrder(sessionResponse.getCurrentTurnOrder())
-                    .turns(existingTurns.getTurns())
-                    .build();
+            if (validation.valid()) {
+                log.info(
+                        "Returning existing coaching script turns. sessionId={}, coachingSessionId={}, requestedOptionType={}, selectedOption={}, turnCount={}",
+                        sessionId,
+                        coachingSessionId,
+                        request.getOptionType(),
+                        effectiveOptionType,
+                        validation.turnCount()
+                );
+
+                return CoachingConversationDto.ResponsePrepareScript.builder()
+                        .coachingSessionId(coachingSessionId)
+                        .sessionId(sessionResponse.getSessionId())
+                        .coachingSessionStatus(sessionResponse.getCoachingSessionStatus())
+                        .selectedOption(effectiveOptionType)
+                        .currentTurnOrder(sessionResponse.getCurrentTurnOrder())
+                        .turns(existingTurns.getTurns())
+                        .build();
+            }
+
+            log.warn(
+                    "Invalid existing coaching script turns detected. sessionId={}, coachingSessionId={}, selectedOption={}, turnCount={}, duplicatedTurnOrders={}, invalidReason={}, recoveryAction=RESET_AND_REGENERATE",
+                    sessionId,
+                    coachingSessionId,
+                    effectiveOptionType,
+                    validation.turnCount(),
+                    validation.duplicatedTurnOrders(),
+                    validation.reason()
+            );
+
+            resetCoachingSessionScriptData(coachingSessionId);
         }
 
-        FastApiOpenAiDto.ResponseCoachingScript scriptResponse =
-                fastApiOpenAiClient.createCoachingScript(
-                        FastApiOpenAiDto.RequestCoachingScript.builder()
-                                .optionType(request.getOptionType())
-                                .placeName(request.getPlaceName())
-                                .country(request.getCountry())
-                                .city(request.getCity())
-                                .placeAddress(request.getPlaceAddress())
-                                .evaluation(request.getEvaluation())
-                                .previousMessages(request.getPreviousMessages())
-                                .build()
-                );
+        log.info(
+                "Preparing to call FastAPI coaching script. sessionId={}, coachingSessionId={}, requestedOptionType={}, selectedOption={}",
+                sessionId,
+                coachingSessionId,
+                request.getOptionType(),
+                effectiveOptionType
+        );
+
+        FastApiOpenAiDto.ResponseCoachingScript scriptResponse;
+
+        try {
+            scriptResponse = fastApiOpenAiClient.createCoachingScript(
+                    FastApiOpenAiDto.RequestCoachingScript.builder()
+                            .optionType(effectiveOptionType)
+                            .placeName(request.getPlaceName())
+                            .country(request.getCountry())
+                            .city(request.getCity())
+                            .placeAddress(request.getPlaceAddress())
+                            .evaluation(request.getEvaluation())
+                            .previousMessages(request.getPreviousMessages())
+                            .build()
+            );
+        } catch (RuntimeException e) {
+            Throwable rootCause = getRootCause(e);
+            log.error(
+                    "FastAPI coaching script call failed. sessionId={}, coachingSessionId={}, optionType={}, causeClass={}, causeMessage={}",
+                    sessionId,
+                    coachingSessionId,
+                    effectiveOptionType,
+                    rootCause.getClass().getName(),
+                    rootCause.getMessage()
+            );
+            throw e;
+        }
+
+        int messageCount = scriptResponse.getMessages() == null
+                ? 0
+                : scriptResponse.getMessages().size();
+
+        log.info(
+                "FastAPI coaching script call completed. sessionId={}, coachingSessionId={}, selectedOption={}, messageCount={}",
+                sessionId,
+                coachingSessionId,
+                effectiveOptionType,
+                messageCount
+        );
 
         List<CoachingScriptTurnDto.RequestSaveCoachingScriptTurn> turnRequests =
                 convertMessagesToScriptTurns(
@@ -156,7 +227,7 @@ public class CoachingConversationServiceImpl implements CoachingConversationServ
                 .coachingSessionId(coachingSessionId)
                 .sessionId(sessionResponse.getSessionId())
                 .coachingSessionStatus(sessionResponse.getCoachingSessionStatus())
-                .selectedOption(sessionResponse.getSelectedOption())
+                .selectedOption(effectiveOptionType)
                 .currentTurnOrder(sessionResponse.getCurrentTurnOrder())
                 .turns(savedTurns)
                 .build();
@@ -172,22 +243,51 @@ public class CoachingConversationServiceImpl implements CoachingConversationServ
 
         validateAiCoachingAccess(userId);
 
+        CoachingScriptTurnDto.ResponseGetCoachingScriptTurns existingTurns =
+                coachingScriptTurnService.getScriptTurns(coachingSessionId);
+        ScriptTurnValidation validation = validateScriptTurns(existingTurns.getTurns());
+
+        if (!validation.valid()) {
+            log.error(
+                    "Cannot start coaching conversation because script turns are invalid. coachingSessionId={}, selectedOption={}, turnCount={}, duplicatedTurnOrders={}, invalidReason={}, recoveryAction=RESET_ON_NEXT_PREPARE",
+                    coachingSessionId,
+                    session.getSelectedOption(),
+                    validation.turnCount(),
+                    validation.duplicatedTurnOrders(),
+                    validation.reason()
+            );
+            resetCoachingSessionScriptData(coachingSessionId);
+            throw new InvalidCoachingMessageException();
+        }
+
         CoachingScriptTurnDto.ResponseCoachingScriptTurn firstTurn =
                 coachingScriptTurnService.getScriptTurn(coachingSessionId, 1);
 
-        FastApiSpeechDto.ResponseTts ttsResponse =
-                fastApiSpeechClient.createTts(
-                        FastApiSpeechDto.RequestTts.builder()
-                                .text(firstTurn.getAssistantText())
-                                .build()
-                );
+        CoachingMessageDto.ResponseCoachingMessage existingAssistantMessage =
+                coachingMessageRepository
+                        .findFirstByCoachingSession_CoachingSessionIdAndCoachingScriptTurn_CoachingScriptTurnIdAndRoleOrderByCreatedAtAsc(
+                                coachingSessionId,
+                                firstTurn.getCoachingScriptTurnId(),
+                                CoachingMessageRole.ASSISTANT
+                        )
+                        .map(CoachingMessageDto.ResponseCoachingMessage::from)
+                        .orElse(null);
 
-        coachingMessageService.saveAssistantMessage(
-                coachingSessionId,
-                firstTurn.getCoachingScriptTurnId(),
-                firstTurn.getAssistantText(),
-                ttsResponse.getAudioUrl()
-        );
+        String assistantText = existingAssistantMessage != null
+                ? existingAssistantMessage.getMessage()
+                : firstTurn.getAssistantText();
+        String assistantAudioUrl = existingAssistantMessage != null
+                ? existingAssistantMessage.getAudioUrl()
+                : createTtsAudioUrlOrNull(coachingSessionId, firstTurn);
+
+        if (existingAssistantMessage == null) {
+            coachingMessageService.saveAssistantMessage(
+                    coachingSessionId,
+                    firstTurn.getCoachingScriptTurnId(),
+                    assistantText,
+                    assistantAudioUrl
+            );
+        }
 
         session.updateCurrentTurnOrder(1);
 
@@ -195,8 +295,8 @@ public class CoachingConversationServiceImpl implements CoachingConversationServ
                 .coachingSessionId(coachingSessionId)
                 .coachingScriptTurnId(firstTurn.getCoachingScriptTurnId())
                 .turnOrder(firstTurn.getTurnOrder())
-                .assistantText(firstTurn.getAssistantText())
-                .assistantAudioUrl(ttsResponse.getAudioUrl())
+                .assistantText(assistantText)
+                .assistantAudioUrl(assistantAudioUrl)
                 .build();
     }
 
@@ -242,11 +342,32 @@ public class CoachingConversationServiceImpl implements CoachingConversationServ
                         currentTurnOrder
                 );
 
+        log.info(
+                "Processing coaching speech. coachingSessionId={}, userId={}, currentTurnOrder={}, audioFilename={}, audioContentType={}, audioSize={}",
+                coachingSessionId,
+                userId,
+                currentTurnOrder,
+                audioFile.getOriginalFilename(),
+                audioFile.getContentType(),
+                audioFile.getSize()
+        );
+
+        long pronunciationStartedAt = System.currentTimeMillis();
+
         FastApiSpeechDto.ResponsePronunciationAssessment pronunciation =
                 fastApiSpeechClient.assessPronunciation(
                         currentTurn.getExpectedText(),
                         audioFile
                 );
+
+        log.info(
+                "Pronunciation assessment completed. coachingSessionId={}, currentTurnOrder={}, elapsedMs={}, recognizedTextLength={}, hasFeedback={}",
+                coachingSessionId,
+                currentTurnOrder,
+                System.currentTimeMillis() - pronunciationStartedAt,
+                pronunciation.getRecognizedText() == null ? 0 : pronunciation.getRecognizedText().length(),
+                pronunciation.getFeedback() != null
+        );
 
         CoachingMessageDto.ResponseCoachingMessage savedUserMessage =
                 coachingMessageService.saveUserMessage(
@@ -293,12 +414,28 @@ public class CoachingConversationServiceImpl implements CoachingConversationServ
                         nextTurnOrder
                 );
 
+        log.info(
+                "Creating next assistant TTS. coachingSessionId={}, nextTurnOrder={}",
+                coachingSessionId,
+                nextTurnOrder
+        );
+
+        long nextTtsStartedAt = System.currentTimeMillis();
+
         FastApiSpeechDto.ResponseTts nextTts =
                 fastApiSpeechClient.createTts(
                         FastApiSpeechDto.RequestTts.builder()
                                 .text(nextTurn.getAssistantText())
                                 .build()
                 );
+
+        log.info(
+                "Next assistant TTS completed. coachingSessionId={}, nextTurnOrder={}, elapsedMs={}, audioUrlPresent={}",
+                coachingSessionId,
+                nextTurnOrder,
+                System.currentTimeMillis() - nextTtsStartedAt,
+                nextTts.getAudioUrl() != null
+        );
 
         coachingMessageService.saveAssistantMessage(
                 coachingSessionId,
@@ -343,6 +480,15 @@ public class CoachingConversationServiceImpl implements CoachingConversationServ
         CoachingPronunciationResultDto.ResponseGetPronunciationResults pronunciationResponse =
                 pronunciationResultService.getPronunciationResults(coachingSessionId);
 
+        log.info(
+                "Finishing coaching conversation. coachingSessionId={}, messageCount={}, pronunciationResultCount={}",
+                coachingSessionId,
+                messagesResponse.getMessages() == null ? 0 : messagesResponse.getMessages().size(),
+                pronunciationResponse.getPronunciationResults() == null ? 0 : pronunciationResponse.getPronunciationResults().size()
+        );
+
+        long finalFeedbackStartedAt = System.currentTimeMillis();
+
         FastApiOpenAiDto.ResponseFinalFeedback finalFeedback =
                 fastApiOpenAiClient.createFinalFeedback(
                         FastApiOpenAiDto.RequestFinalFeedback.builder()
@@ -350,6 +496,13 @@ public class CoachingConversationServiceImpl implements CoachingConversationServ
                                 .pronunciationResults(toFastApiPronunciationResults(pronunciationResponse))
                                 .build()
                 );
+
+        log.info(
+                "FastAPI final feedback completed. coachingSessionId={}, elapsedMs={}, totalScore={}",
+                coachingSessionId,
+                System.currentTimeMillis() - finalFeedbackStartedAt,
+                finalFeedback.getTotalScore()
+        );
 
         CoachingFeedbackDto.ResponseCoachingFeedback savedFeedback =
                 coachingFeedbackService.saveCoachingFeedback(
@@ -369,32 +522,7 @@ public class CoachingConversationServiceImpl implements CoachingConversationServ
 
         session.complete();
 
-        if (!contentRepository.existsByCoachingSession_CoachingSessionId(coachingSessionId)) {
-            FastApiOpenAiDto.ResponseYoutubeKeywords keywords =
-                    fastApiOpenAiClient.createYoutubeKeywords(
-                            FastApiOpenAiDto.RequestYoutubeKeywords.builder()
-                                    .finalFeedback(finalFeedback.getSummaryFeedback())
-                                    .build()
-                    );
-
-            if (keywords.getKeywords() != null && !keywords.getKeywords().isEmpty()) {
-                String keyword = keywords.getKeywords().get(0);
-
-                FastApiYoutubeDto.ResponseYoutubeSearch youtubeResponse =
-                        fastApiYoutubeClient.searchYoutube(
-                                FastApiYoutubeDto.RequestYoutubeSearch.builder()
-                                        .keyword(keyword)
-                                        .maxResults(AiUsageLimitPolicy.YOUTUBE_MAX_RESULTS)
-                                        .build()
-                        );
-
-                contentService.saveAll(
-                        coachingSessionId,
-                        keyword,
-                        youtubeResponse.getYoutubePicks()
-                );
-            }
-        }
+        createRecommendationContentsIfNeeded(coachingSessionId, finalFeedback);
 
         ContentDto.ResponseGetContents contents =
                 contentService.getContents(coachingSessionId);
@@ -406,8 +534,144 @@ public class CoachingConversationServiceImpl implements CoachingConversationServ
                 .build();
     }
 
+    private void createRecommendationContentsIfNeeded(
+            Long coachingSessionId,
+            FastApiOpenAiDto.ResponseFinalFeedback finalFeedback
+    ) {
+        if (!contentRepository.existsByCoachingSession_CoachingSessionId(coachingSessionId)) {
+            try {
+                FastApiOpenAiDto.ResponseYoutubeKeywords keywords =
+                        fastApiOpenAiClient.createYoutubeKeywords(
+                                FastApiOpenAiDto.RequestYoutubeKeywords.builder()
+                                        .finalFeedback(finalFeedback.getSummaryFeedback())
+                                        .build()
+                        );
+
+                if (keywords.getKeywords() != null && !keywords.getKeywords().isEmpty()) {
+                    String keyword = keywords.getKeywords().get(0);
+
+                    FastApiYoutubeDto.ResponseYoutubeSearch youtubeResponse =
+                            fastApiYoutubeClient.searchYoutube(
+                                    FastApiYoutubeDto.RequestYoutubeSearch.builder()
+                                            .keyword(keyword)
+                                            .maxResults(AiUsageLimitPolicy.YOUTUBE_MAX_RESULTS)
+                                            .build()
+                            );
+
+                    contentService.saveAll(
+                            coachingSessionId,
+                            keyword,
+                            youtubeResponse.getYoutubePicks()
+                    );
+                }
+            } catch (RuntimeException e) {
+                Throwable rootCause = getRootCause(e);
+                log.error(
+                        "Coaching recommendation content generation failed. coachingSessionId={}, causeClass={}, causeMessage={}",
+                        coachingSessionId,
+                        rootCause.getClass().getName(),
+                        rootCause.getMessage()
+                );
+            }
+        }
+    }
+
+    private String createTtsAudioUrlOrNull(
+            Long coachingSessionId,
+            CoachingScriptTurnDto.ResponseCoachingScriptTurn turn
+    ) {
+        try {
+            FastApiSpeechDto.ResponseTts ttsResponse =
+                    fastApiSpeechClient.createTts(
+                            FastApiSpeechDto.RequestTts.builder()
+                                    .text(turn.getAssistantText())
+                                    .build()
+                    );
+
+            return ttsResponse.getAudioUrl();
+        } catch (RuntimeException e) {
+            Throwable rootCause = getRootCause(e);
+            log.error(
+                    "Initial assistant TTS failed. coachingSessionId={}, turnOrder={}, causeClass={}, causeMessage={}",
+                    coachingSessionId,
+                    turn.getTurnOrder(),
+                    rootCause.getClass().getName(),
+                    rootCause.getMessage()
+            );
+
+            return null;
+        }
+    }
+
+    private void resetCoachingSessionScriptData(Long coachingSessionId) {
+        pronunciationResultRepository
+                .deleteByCoachingScriptTurn_CoachingSession_CoachingSessionId(coachingSessionId);
+        coachingMessageRepository.deleteByCoachingSession_CoachingSessionId(coachingSessionId);
+        coachingScriptTurnRepository.deleteByCoachingSession_CoachingSessionId(coachingSessionId);
+
+        log.warn(
+                "Coaching session script data reset. coachingSessionId={}, recoveryAction=DELETE_PRONUNCIATION_RESULTS_MESSAGES_SCRIPT_TURNS",
+                coachingSessionId
+        );
+    }
+
+    private ScriptTurnValidation validateScriptTurns(
+            List<CoachingScriptTurnDto.ResponseCoachingScriptTurn> turns
+    ) {
+        if (turns == null || turns.isEmpty()) {
+            return new ScriptTurnValidation(false, 0, "none", "EMPTY_TURNS");
+        }
+
+        Set<Integer> seenTurnOrders = new HashSet<>();
+        List<Integer> duplicatedTurnOrders = new ArrayList<>();
+        boolean hasBlankText = false;
+
+        for (CoachingScriptTurnDto.ResponseCoachingScriptTurn turn : turns) {
+            if (turn == null || turn.getTurnOrder() == null) {
+                return new ScriptTurnValidation(
+                        false,
+                        turns.size(),
+                        duplicatedTurnOrders.toString(),
+                        "NULL_TURN_OR_ORDER"
+                );
+            }
+
+            if (!seenTurnOrders.add(turn.getTurnOrder())) {
+                duplicatedTurnOrders.add(turn.getTurnOrder());
+            }
+
+            if (turn.getAssistantText() == null || turn.getAssistantText().isBlank()
+                    || turn.getExpectedText() == null || turn.getExpectedText().isBlank()) {
+                hasBlankText = true;
+            }
+        }
+
+        boolean isConsecutive = true;
+
+        for (int order = 1; order <= turns.size(); order++) {
+            if (!seenTurnOrders.contains(order)) {
+                isConsecutive = false;
+                break;
+            }
+        }
+
+        boolean valid = duplicatedTurnOrders.isEmpty() && !hasBlankText && isConsecutive;
+        String reason = valid
+                ? "OK"
+                : "duplicate=" + !duplicatedTurnOrders.isEmpty()
+                + ",blankText=" + hasBlankText
+                + ",consecutive=" + isConsecutive;
+
+        return new ScriptTurnValidation(
+                valid,
+                turns.size(),
+                duplicatedTurnOrders.toString(),
+                reason
+        );
+    }
+
     private void validateAiCoachingAccess(Long userId) {
-        if (!AiUsageLimitPolicy.hasValidAiCoachingAccess(userId)) {
+        if (!subscriptionValidator.isPremium(userId)) {
             throw new AiCoachingAccessDeniedException();
         }
     }
@@ -555,5 +819,23 @@ public class CoachingConversationServiceImpl implements CoachingConversationServ
         } catch (JsonProcessingException e) {
             return "[]";
         }
+    }
+
+    private Throwable getRootCause(Throwable throwable) {
+        Throwable rootCause = throwable;
+
+        while (rootCause.getCause() != null) {
+            rootCause = rootCause.getCause();
+        }
+
+        return rootCause;
+    }
+
+    private record ScriptTurnValidation(
+            boolean valid,
+            int turnCount,
+            String duplicatedTurnOrders,
+            String reason
+    ) {
     }
 }

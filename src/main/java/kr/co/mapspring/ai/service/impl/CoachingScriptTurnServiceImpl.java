@@ -73,10 +73,14 @@ public class CoachingScriptTurnServiceImpl implements CoachingScriptTurnService 
             Integer turnOrder
     ) {
         CoachingScriptTurn scriptTurn = coachingScriptTurnRepository
-                .findByCoachingSession_CoachingSessionIdAndTurnOrder(
+                .findAllByCoachingSession_CoachingSessionIdAndTurnOrderOrderByCreatedAtAsc(
                         coachingSessionId,
                         turnOrder
                 )
+                .stream()
+                .filter(turn -> turn.getAssistantText() != null && !turn.getAssistantText().isBlank())
+                .filter(turn -> turn.getExpectedText() != null && !turn.getExpectedText().isBlank())
+                .findFirst()
                 .orElseThrow(CoachingScriptTurnNotFoundException::new);
 
         return CoachingScriptTurnDto.ResponseCoachingScriptTurn.from(scriptTurn);

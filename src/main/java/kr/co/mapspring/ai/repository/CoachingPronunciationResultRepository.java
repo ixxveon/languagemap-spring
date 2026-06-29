@@ -17,4 +17,6 @@ public interface CoachingPronunciationResultRepository
     List<CoachingPronunciationResult> findByCoachingScriptTurn_CoachingSession_CoachingSessionIdOrderByCreatedAtAsc(
             Long coachingSessionId
     );
+
+    void deleteByCoachingScriptTurn_CoachingSession_CoachingSessionId(Long coachingSessionId);
 }
